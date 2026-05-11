@@ -1,0 +1,10 @@
+torch
+torchvision
+open_clip_torch
+opencv-python-headless
+pandas
+numpy
+streamlit
+ultralytics
+pillow
+scikit-learn

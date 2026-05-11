@@ -8,3 +8,4 @@ streamlit
 ultralytics
 pillow
 scikit-learn
+transformers

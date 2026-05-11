@@ -1,0 +1,8 @@
+{
+  "model_name": "ViT-L-14",
+  "pretrained": "openai",
+  "num_indexed": 12612,
+  "img_dir": "",
+  "img_col": "resolved_filename",
+  "caption_col": "clean_caption"
+}

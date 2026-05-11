@@ -1,0 +1,7 @@
+{
+  "model_name": "ViT-L-14",
+  "pretrained": "openai",
+  "num_indexed": 12612,
+  "img_dir": "/Users/arnavoruganty/Developer/College Semesters/Sem-6/VR/Final Project/visual_search/data/archive/cropped_images",
+  "img_col": "resolved_filename"
+}

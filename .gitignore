@@ -1,0 +1,6 @@
+
+# Large model weights
+*.pt
+*.pth
+*.onnx
+*.bin

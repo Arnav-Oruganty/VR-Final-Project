@@ -10,52 +10,68 @@ Streamlit demo for DeepFashion In-Shop retrieval with three modes:
 
 The current indexes use `ViT-B-32` / `openai`, so all gallery embeddings are 512-dimensional.
 
-## Repository Files
-
-Commit these files:
-
-```text
-visual_search/app.py
-visual_search/build_index.py
-visual_search/requirements.txt
-visual_search/README.md
-visual_search/index/config.json
-visual_search/checkpoints/.gitkeep
-```
-
-Do not commit the dataset, `.npy` index files, model checkpoints, local environments, or YOLO weights. They are intentionally ignored by `.gitignore`.
-
-## Required Local Artifacts
-
-After cloning the repo, download or copy the artifacts into these exact paths:
+## What's Included (Committed to Git)
 
 ```text
 visual_search/
-├── checkpoints/
-│   └── clip_finetuned.pt              # Required for Condition C
+├── app.py                             # Main Streamlit application
+├── build_index.py                     # Script to build embeddings
+├── requirements.txt                   # Python dependencies
+├── README.md                          # This file
 ├── data/
-│   └── split_images/
-│       ├── gallery/                   # Required at runtime
-│       └── train/                     # Only needed for training/rebuilding C
-└── index/
-    ├── config.json                    # Committed, model config
-    ├── gallery_embs.npy               # Frozen CLIP gallery image embeddings
-    ├── gallery_embs_finetuned.npy     # Fine-tuned CLIP gallery image embeddings
-    ├── gallery_text_embs.npy          # CLIP text embeddings of BLIP captions
-    ├── gallery_index.csv              # Optional plain metadata
-    └── gallery_index_blip.csv         # Gallery metadata + BLIP captions
+│   └── split_images/                  # ✓ INCLUDED | Gallery, query, and train images
+├── index/
+│   ├── config.json                    # ✓ INCLUDED | Model configuration
+│   ├── gallery_embs.npy               # ✓ INCLUDED | Frozen CLIP embeddings
+│   ├── gallery_embs_finetuned.npy     # ✓ INCLUDED | Fine-tuned CLIP embeddings
+│   ├── gallery_text_embs.npy          # ✓ INCLUDED | BLIP caption embeddings
+│   ├── gallery_index_blip.csv         # ✓ INCLUDED | Gallery metadata + captions
+│   └── gallery_index.csv              # ✓ INCLUDED | Plain metadata
+└── checkpoints/
+    └── .gitkeep                       # Placeholder
 ```
 
-The four gallery files must be row-aligned:
+**These files and directories are all tracked in the repository.**
+
+## What's Excluded (Ignored by .gitignore)
 
 ```text
-gallery_index_blip.csv
-gallery_embs.npy
-gallery_embs_finetuned.npy
-gallery_text_embs.npy
+✗ Local environments:
+  - visual_search/.conda/              # Local Conda environment
+  - .venv/, venv/                      # Virtual environments
+
+✗ Archive data:
+  - visual_search/data/archive/        # Old/archived dataset
+
+✗ Model weights (except clip_finetuned.pt):
+  - *.pt, *.pth, *.ckpt               # PyTorch model checkpoints (YOLO, etc.)
+  - *.onnx, *.bin, *.safetensors      # Other model formats
+
+✗ Python cache:
+  - __pycache__/                       # Python bytecode
+  - *.pyc, *.pyo, *.pyd               # Compiled Python files
+
+✗ OS files:
+  - .DS_Store                          # macOS metadata
 ```
 
-Row `i` in every file must describe the same gallery image.
+**Only `clip_finetuned.pt` needs to be added to `checkpoints/` after cloning.**
+
+## Required Local Artifacts (Only After Cloning)
+
+After cloning the repo, you only need to add one file:
+
+```text
+visual_search/checkpoints/
+└── clip_finetuned.pt              # Only file to add | Required for Condition C | Download/train separately
+```
+
+**All other data files are already in the repository:**
+- `split_images/` (gallery, query, train images)
+- All `.npy` embedding files
+- All `.csv` metadata files
+
+**Note:** The checkpoint must be row-aligned with the embeddings in `gallery_embs_finetuned.npy`.
 
 ## Setup
 

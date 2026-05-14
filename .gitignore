@@ -4,3 +4,7 @@
 *.pth
 *.onnx
 *.bin
+
+# Plan files
+plan.md
+*.plan.md

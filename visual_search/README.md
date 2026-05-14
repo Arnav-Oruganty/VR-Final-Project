@@ -1,174 +1,179 @@
-# 🛍️ Visual Product Search — DeepFashion In-Shop Retrieval
+# Visual Product Search
 
-A two-stage visual search system using **Frozen CLIP** (Condition A) and **BLIP ITM Re-ranking** (Condition B) for clothing retrieval on the DeepFashion In-Shop dataset.
+Streamlit demo for DeepFashion In-Shop retrieval with three modes:
 
----
+| Condition | Runtime behavior |
+| --- | --- |
+| A | Frozen CLIP image-to-image search |
+| B | Frozen CLIP + BLIP caption text fusion/reranking |
+| C | Fine-tuned CLIP + BLIP caption text fusion/reranking |
 
-## Project Structure
+The current indexes use `ViT-B-32` / `openai`, so all gallery embeddings are 512-dimensional.
 
+## Repository Files
+
+Commit these files:
+
+```text
+visual_search/app.py
+visual_search/build_index.py
+visual_search/requirements.txt
+visual_search/README.md
+visual_search/index/config.json
+visual_search/checkpoints/.gitkeep
 ```
+
+Do not commit the dataset, `.npy` index files, model checkpoints, local environments, or YOLO weights. They are intentionally ignored by `.gitignore`.
+
+## Required Local Artifacts
+
+After cloning the repo, download or copy the artifacts into these exact paths:
+
+```text
 visual_search/
-├── app.py                    # Streamlit search interface
-├── build_index.py            # (Optional) Build CLIP gallery index locally
-├── requirements.txt          # Python dependencies
-├── captions (1).csv          # BLIP2-generated captions (Salesforce/blip2-opt-2.7b)
-│
-├── index/                    # Pre-built index files (download from Kaggle)
-│   ├── gallery_embs.npy          # CLIP ViT-L-14 vision embeddings (12,612 × 768)
-│   ├── gallery_text_embs.npy     # CLIP text embeddings of BLIP2 captions (12,612 × 768)
-│   ├── gallery_index.csv         # Gallery metadata (image paths, item IDs)
-│   ├── gallery_index_blip.csv    # Gallery metadata + BLIP2 captions
-│   └── config.json               # Index configuration
-│
-└── data/
-    └── archive/
-        ├── cropped_images/       # YOLO-cropped gallery images (~12,612 JPGs)
-        ├── cropped_metadata.csv  # Image paths, item IDs, splits
-        └── all_metadata.csv      # Full dataset metadata
+├── checkpoints/
+│   └── clip_finetuned.pt              # Required for Condition C
+├── data/
+│   └── split_images/
+│       ├── gallery/                   # Required at runtime
+│       └── train/                     # Only needed for training/rebuilding C
+└── index/
+    ├── config.json                    # Committed, model config
+    ├── gallery_embs.npy               # Frozen CLIP gallery image embeddings
+    ├── gallery_embs_finetuned.npy     # Fine-tuned CLIP gallery image embeddings
+    ├── gallery_text_embs.npy          # CLIP text embeddings of BLIP captions
+    ├── gallery_index.csv              # Optional plain metadata
+    └── gallery_index_blip.csv         # Gallery metadata + BLIP captions
 ```
 
----
+The four gallery files must be row-aligned:
+
+```text
+gallery_index_blip.csv
+gallery_embs.npy
+gallery_embs_finetuned.npy
+gallery_text_embs.npy
+```
+
+Row `i` in every file must describe the same gallery image.
 
 ## Setup
 
-### 1. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-> **Requirements:** `torch`, `open_clip_torch`, `streamlit`, `ultralytics`, `transformers`, `opencv-python-headless`, `pandas`, `numpy`, `pillow`
-
----
-
-### 2. Data & Index Files
-
-The index files were generated using Kaggle (GPU) notebooks. You need:
-
-| File | Source | Description |
-|------|--------|-------------|
-| `cropped_images/` | Kaggle dataset `mithilesh2303/preprocessed-deepfashion` | YOLO-cropped gallery images |
-| `gallery_embs.npy` | `a-vision-only-clip.ipynb` → Kaggle output | CLIP vision embeddings |
-| `gallery_index.csv` | `a-vision-only-clip.ipynb` → Kaggle output | Gallery metadata |
-| `gallery_text_embs.npy` | BLIP index Kaggle notebook → Kaggle output | CLIP text encodings of captions |
-| `gallery_index_blip.csv` | BLIP index Kaggle notebook → Kaggle output | Metadata + BLIP2 captions |
-| `captions (1).csv` | Provided by team (BLIP2 captioning notebook) | Captions for all 52,712 images |
-
-Place extracted files as shown in the project structure above.
-
----
-
-### 3. Run the App
+Create and activate an environment. Python 3.11 is recommended.
 
 ```bash
 cd visual_search
-streamlit run app.py
+conda create -p ./.conda python=3.11 -y
+conda activate ./.conda
+python -m pip install -r requirements.txt
 ```
 
-The app opens at **http://localhost:8501**
-
----
-
-## Using the App
-
-### Sidebar Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| **Index Directory** | `./index` | Path to the folder containing `.npy` and `.csv` index files |
-| **Images Directory** | `./data/archive/cropped_images` | Path to your local `cropped_images` folder |
-| **Final Top-K** | 10 | Number of results to display |
-| **Re-ranking Mode** | None | Choose between the 3 retrieval modes (see below) |
-| **CLIP candidates to re-rank** | 50 | How many CLIP results BLIP re-ranks |
-
-### 3 Retrieval Modes
-
-| Mode | Speed | How It Works |
-|------|-------|--------------|
-| **None (CLIP only)** | ⚡ Instant | Cosine similarity between query image embedding and gallery vision embeddings |
-| **BLIP Text Similarity** | ⚡ Fast | CLIP retrieves top-N → re-rank by cosine similarity between query image embedding and gallery caption text embeddings (`gallery_text_embs.npy`) |
-| **BLIP ITM (neural)** | 🐢 ~10–20s on CPU | CLIP retrieves top-N → `Salesforce/blip-itm-base-coco` scores each (query image, gallery caption) pair and re-ranks by ITM match probability |
-
-### Search Flow
-
-1. **Upload** a clothing image (JPG/PNG)
-2. **YOLOv8n** automatically detects and crops the clothing item
-3. Toggle the crop on/off using the checkbox
-4. Click **🔍 Search**
-5. **Stage 1**: CLIP encodes the query image → cosine similarity with gallery
-6. **Stage 2** *(if enabled)*: BLIP re-ranks the top candidates
-7. Results are displayed in a grid with similarity scores and captions
-
----
-
-## Rebuilding the Index Locally (Optional)
-
-If you want to rebuild the CLIP gallery index from scratch (takes ~5–10 min on CPU):
+## Run
 
 ```bash
-python build_index.py \
-    --csv data/archive/all_metadata.csv \
-    --img_dir data/archive/cropped_images \
-    --out_dir ./index
+cd visual_search
+conda activate ./.conda
+python -m streamlit run app.py
 ```
 
-> **Note:** The pre-built index from Kaggle is recommended since it was computed on GPU.
+Use these sidebar paths:
 
----
+```text
+Index Directory  = ./index
+Images Directory = ./data/split_images/gallery
+```
 
-## Kaggle Notebooks
+## Sidebar Modes
 
-| Notebook | Purpose |
-|----------|---------|
-| `preproc-yolo.ipynb` | YOLOv8-based image cropping + metadata generation |
-| `a-vision-only-clip.ipynb` | Frozen CLIP ViT-L-14 gallery indexing + Recall/NDCG/mAP metrics (Condition A) |
-| *(BLIP captioning notebook — team)* | BLIP2-opt-2.7b caption generation for all 52,712 images |
-| *(BLIP index notebook)* | CLIP text encoding of captions → `gallery_text_embs.npy` |
+### Condition A
 
----
+Uses:
 
-## Models Used
+```text
+index/gallery_embs.npy
+index/gallery_index_blip.csv or index/gallery_index.csv
+data/split_images/gallery/
+```
 
-| Model | Use |
-|-------|-----|
-| `openai/clip-vit-large-patch14` (`ViT-L-14`) | Gallery vision embeddings + query embedding at search time |
-| `Salesforce/blip2-opt-2.7b` | Caption generation (offline, done on Kaggle) |
-| `Salesforce/blip-itm-base-coco` | BLIP ITM neural re-ranking (loaded on-demand in app) |
-| `ultralytics/yolov8n` | Query image clothing detection + cropping |
+Search is direct CLIP image cosine similarity.
 
----
+### Condition B
 
-## Condition Summary
+Uses:
 
-| Condition | Method | Index Files Used |
-|-----------|--------|-----------------|
-| **A** — Vision-only CLIP | CLIP image → CLIP image cosine sim | `gallery_embs.npy` |
-| **B** — BLIP Caption Re-ranking | CLIP image → CLIP text cosine sim (fast) or BLIP ITM (neural) | `gallery_text_embs.npy` + `gallery_index_blip.csv` |
+```text
+index/gallery_embs.npy
+index/gallery_text_embs.npy
+index/gallery_index_blip.csv
+data/split_images/gallery/
+```
 
----
+Recommended demo setting:
 
-## Metrics (Condition A — from Kaggle)
+```text
+Condition = B - Frozen CLIP + BLIP captions
+B/C retrieval mode = Alpha fusion
+alpha image weight = 0.7
+```
 
-Evaluated on 14,218 query images vs 12,612 gallery images.
+Other B modes:
 
-| Metric | @5 | @10 | @15 |
-|--------|----|-----|-----|
-| **Recall** | 0.0082 | 0.0132 | 0.0155 |
-| **NDCG** | 0.0057 | 0.0088 | 0.0104 |
-| **mAP** | 0.0034 | 0.0040 | 0.0041 |
+```text
+BLIP Text Similarity rerank
+BLIP ITM neural rerank
+```
 
----
+BLIP ITM downloads `Salesforce/blip-itm-base-coco` on first use and is slower on CPU.
+
+### Condition C
+
+Uses:
+
+```text
+checkpoints/clip_finetuned.pt
+index/gallery_embs_finetuned.npy
+index/gallery_text_embs.npy
+index/gallery_index_blip.csv
+data/split_images/gallery/
+```
+
+The checkpoint and `gallery_embs_finetuned.npy` must come from the same fine-tuned CLIP run.
+
+## Artifact Checklist
+
+Before running, verify:
+
+```text
+gallery_embs.npy            shape = (12612, 512)
+gallery_embs_finetuned.npy  shape = (12612, 512)
+gallery_text_embs.npy       shape = (12612, 512)
+gallery_index_blip.csv      rows  = 12612
+data/split_images/gallery   images = 12612
+```
 
 ## Troubleshooting
 
-**"Image not found" in results**
-→ Check that **Images Directory** in the sidebar points to your local `cropped_images/` folder.
+**Dimension mismatch during search**
 
-**Index not loading**
-→ Verify all 3 required files exist in your index directory: `gallery_embs.npy`, `gallery_index.csv` (or `gallery_index_blip.csv`), and `config.json`.
+Check `index/config.json`. The current indexes expect:
 
-**BLIP ITM slow on CPU**
-→ Reduce **CLIP candidates to re-rank** to 20 in the sidebar. First run also downloads the model (~450 MB).
+```json
+{
+  "model": "ViT-B-32",
+  "pretrained": "openai"
+}
+```
 
-**BLIP ITM mode not available**
-→ `transformers` must be installed: `pip install transformers`
+**Condition C fails to load**
+
+Make sure `visual_search/checkpoints/clip_finetuned.pt` is present and was saved from the same model used to build `gallery_embs_finetuned.npy`.
+
+**Images not found**
+
+Set the Streamlit sidebar to:
+
+```text
+Images Directory = ./data/split_images/gallery
+```
+
+The app resolves absolute Kaggle-style paths by falling back to the image basename in this local folder.

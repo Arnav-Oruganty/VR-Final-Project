@@ -160,7 +160,7 @@ def draw_regions_on_image(pil_img, regions, selected=None):
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
 @st.cache_resource
-def load_models():
+def load_models(clip_model_name, clip_pretrained):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # YOLOv8x — best accuracy in the v8 family
@@ -171,17 +171,48 @@ def load_models():
         yolo = YOLO("yolov8n.pt")
 
     model, _, preprocess = open_clip.create_model_and_transforms(
-        'ViT-L-14', pretrained='openai'
+        clip_model_name, pretrained=clip_pretrained
     )
-    tokenizer = open_clip.get_tokenizer('ViT-L-14')
+    tokenizer = open_clip.get_tokenizer(clip_model_name)
     model.to(device).eval()
     return yolo, model, preprocess, tokenizer, device
 
 
 @st.cache_resource
-def load_index(index_dir):
+def load_finetuned_clip(checkpoint_path, clip_model_name, clip_pretrained, device):
+    state = torch.load(checkpoint_path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    elif isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+
+    if any(k.startswith("vision_model.") for k in state):
+        from transformers import CLIPModel, CLIPProcessor
+        hf_model_id = "openai/clip-vit-base-patch32"
+        model = CLIPModel.from_pretrained(hf_model_id)
+        model.load_state_dict(state)
+        processor = CLIPProcessor.from_pretrained(hf_model_id)
+        model.to(device).eval()
+        return model, processor
+
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        clip_model_name, pretrained=clip_pretrained
+    )
+    model.load_state_dict(state)
+    model.to(device).eval()
+    return model, preprocess
+
+
+@st.cache_data
+def load_config(index_dir):
+    with open(os.path.join(index_dir, 'config.json')) as f:
+        return json.load(f)
+
+
+@st.cache_resource
+def load_index(index_dir, image_emb_file):
     try:
-        clip_embs = np.load(os.path.join(index_dir, 'gallery_embs.npy'))
+        clip_embs = np.load(os.path.join(index_dir, image_emb_file))
         plain_csv = os.path.join(index_dir, 'gallery_index.csv')
         blip_csv  = os.path.join(index_dir, 'gallery_index_blip.csv')
         df = pd.read_csv(blip_csv if os.path.exists(blip_csv) else plain_csv)
@@ -191,6 +222,65 @@ def load_index(index_dir):
     except Exception as e:
         st.error(f"Error loading index: {e}")
         return None, None, None
+
+
+@st.cache_resource
+def load_text_embs(index_dir):
+    path = os.path.join(index_dir, 'gallery_text_embs.npy')
+    if not os.path.exists(path):
+        return None
+    return np.load(path)
+
+
+@st.cache_resource
+def load_blip_itm():
+    from transformers import BlipForImageTextRetrieval, BlipProcessor
+    processor = BlipProcessor.from_pretrained("Salesforce/blip-itm-base-coco")
+    model = BlipForImageTextRetrieval.from_pretrained("Salesforce/blip-itm-base-coco")
+    model.eval()
+    return processor, model
+
+
+def infer_image_column(df, config):
+    configured = config.get('img_col')
+    if configured in df.columns:
+        return configured
+    for col in ('resolved_filename', 'image_path', 'filename', 'file_name', 'path'):
+        if col in df.columns:
+            return col
+    return None
+
+
+def resolve_gallery_image_path(value, img_dir):
+    value = str(value)
+    if os.path.isabs(value) and os.path.exists(value):
+        return value
+    local_path = os.path.join(img_dir, value)
+    if os.path.exists(local_path):
+        return local_path
+    return os.path.join(img_dir, os.path.basename(value))
+
+
+def get_caption(row_data):
+    for col in ('clean_caption', 'caption', 'blip_caption'):
+        if col in row_data and pd.notna(row_data[col]):
+            return str(row_data[col])
+    return ''
+
+
+def encode_query_image(model, preprocess, pil_img, device):
+    if hasattr(model, "get_image_features"):
+        inputs = preprocess(images=pil_img, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        emb = model.get_image_features(**inputs)
+        if hasattr(emb, "image_embeds"):
+            emb = emb.image_embeds
+        elif hasattr(emb, "pooler_output"):
+            emb = emb.pooler_output
+    else:
+        img_t = preprocess(pil_img).unsqueeze(0).to(device)
+        emb = model.encode_image(img_t)
+    return F.normalize(emb.float(), dim=-1).cpu().numpy()
 
 
 def run_yolo_person(yolo_model, img_rgb):
@@ -209,28 +299,117 @@ def run_yolo_person(yolo_model, img_rgb):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("⚙️ Settings")
 INDEX_DIR = st.sidebar.text_input("Index Directory", "./index")
-IMG_DIR   = st.sidebar.text_input("Images Directory", "./data/archive/cropped_images")
+IMG_DIR   = st.sidebar.text_input("Images Directory", "./data/split_images/gallery")
 top_k     = st.sidebar.slider("Top-K results", 1, 20, 10)
+
+condition = st.sidebar.selectbox(
+    "Condition",
+    [
+        "A - Vision-only CLIP (frozen)",
+        "B - Frozen CLIP + BLIP captions",
+        "C - Fine-tuned CLIP + BLIP captions",
+    ],
+)
+rerank_mode = st.sidebar.selectbox(
+    "B/C retrieval mode",
+    ["Alpha fusion", "BLIP Text Similarity rerank", "BLIP ITM neural rerank"],
+    index=0,
+    disabled=condition.startswith("A"),
+)
+alpha = st.sidebar.slider(
+    "alpha image weight",
+    0.0,
+    1.0,
+    0.7,
+    step=0.1,
+    disabled=condition.startswith("A"),
+)
+blip_candidates = st.sidebar.slider(
+    "CLIP candidates to re-rank",
+    10,
+    200,
+    50,
+    disabled=condition.startswith("A") or rerank_mode == "Alpha fusion",
+)
+FINETUNED_CKPT = st.sidebar.text_input(
+    "Fine-tuned CLIP checkpoint",
+    "./checkpoints/clip_finetuned.pt",
+    disabled=not condition.startswith("C"),
+)
 
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.title("🛍️ Visual Product Search")
-st.markdown("**DeepFashion In-Shop Retrieval · CLIP Vision Search**")
-st.markdown('<span class="badge clip-b">CLIP Vision Search</span>', unsafe_allow_html=True)
+st.markdown("**DeepFashion In-Shop Retrieval · A/B/C Retrieval Demo**")
+st.markdown(f'<span class="badge clip-b">{condition}</span>', unsafe_allow_html=True)
 st.markdown("")
 
 # ── Load models & index ───────────────────────────────────────────────────────
-with st.spinner("Loading CLIP + YOLOv8x…"):
-    yolo_model, clip_model, clip_preprocess, clip_tokenizer, clip_device = load_models()
-
 if not os.path.exists(INDEX_DIR):
     st.warning(f"⚠️ Index directory '{INDEX_DIR}' not found.")
     st.stop()
 
-gallery_embs, gallery_df, config = load_index(INDEX_DIR)
+try:
+    base_config = load_config(INDEX_DIR)
+except Exception as e:
+    st.error(f"Error loading config.json: {e}")
+    st.stop()
+
+clip_model_name = base_config.get("model", "ViT-B-32")
+clip_pretrained = base_config.get("pretrained", "openai")
+
+with st.spinner(f"Loading {clip_model_name} + YOLOv8x..."):
+    yolo_model, clip_model, clip_preprocess, clip_tokenizer, clip_device = load_models(
+        clip_model_name,
+        clip_pretrained,
+    )
+
+image_emb_file = 'gallery_embs_finetuned.npy' if condition.startswith("C") else 'gallery_embs.npy'
+image_emb_path = os.path.join(INDEX_DIR, image_emb_file)
+if not os.path.exists(image_emb_path):
+    st.error(
+        f"Missing `{image_emb_path}`. Upload `{image_emb_file}` into `{INDEX_DIR}` "
+        "before using this condition."
+    )
+    st.stop()
+
+if condition.startswith("C"):
+    if not os.path.exists(FINETUNED_CKPT):
+        st.error(
+            f"Missing `{FINETUNED_CKPT}`. Upload your fine-tuned CLIP checkpoint there "
+            "so the query image uses the same encoder as the fine-tuned gallery index."
+        )
+        st.stop()
+    with st.spinner("Loading fine-tuned CLIP checkpoint..."):
+        clip_model, clip_preprocess = load_finetuned_clip(
+            FINETUNED_CKPT,
+            clip_model_name,
+            clip_pretrained,
+            clip_device,
+        )
+
+gallery_embs, gallery_df, config = load_index(INDEX_DIR, image_emb_file)
 if gallery_embs is None:
     st.stop()
 
-st.sidebar.success(f"✅ {len(gallery_embs):,} CLIP embeddings loaded")
+text_embs = None
+if not condition.startswith("A"):
+    text_embs = load_text_embs(INDEX_DIR)
+    if text_embs is None:
+        st.error(
+            f"Missing `{os.path.join(INDEX_DIR, 'gallery_text_embs.npy')}`. "
+            "Upload it before using Condition B or C."
+        )
+        st.stop()
+    if len(text_embs) != len(gallery_embs):
+        st.error(
+            "Gallery image embeddings and gallery text embeddings have different lengths. "
+            "Rebuild or upload matching index files."
+        )
+        st.stop()
+
+st.sidebar.success(f"✅ {len(gallery_embs):,} image embeddings loaded")
+if text_embs is not None:
+    st.sidebar.success(f"✅ {len(text_embs):,} text embeddings loaded")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if "step" not in st.session_state:
@@ -368,21 +547,73 @@ if uploaded is not None:
                 st.rerun()
 
         if do_search:
-            with st.spinner("CLIP visual retrieval…"):
-                img_t = clip_preprocess(query_crop).unsqueeze(0).to(clip_device)
+            with st.spinner("Encoding query and retrieving candidates..."):
                 with torch.no_grad():
-                    q_img_emb = clip_model.encode_image(img_t)
-                    q_img_emb = F.normalize(q_img_emb.float(), dim=-1).cpu().numpy()
+                    q_img_emb = encode_query_image(
+                        clip_model,
+                        clip_preprocess,
+                        query_crop,
+                        clip_device,
+                    )
 
-                clip_sims   = np.dot(gallery_embs, q_img_emb.T).flatten()
-                top_indices = np.argsort(clip_sims)[::-1][:top_k].tolist()
-                top_scores  = [float(clip_sims[i]) for i in top_indices]
+                image_sims = np.dot(gallery_embs, q_img_emb.T).flatten()
+
+                if condition.startswith("A"):
+                    final_sims = image_sims
+                    top_indices = np.argsort(final_sims)[::-1][:top_k].tolist()
+                    top_scores = [float(final_sims[i]) for i in top_indices]
+                    score_label = "CLIP cos"
+
+                elif rerank_mode == "Alpha fusion":
+                    text_sims = np.dot(text_embs, q_img_emb.T).flatten()
+                    final_sims = alpha * image_sims + (1.0 - alpha) * text_sims
+                    top_indices = np.argsort(final_sims)[::-1][:top_k].tolist()
+                    top_scores = [float(final_sims[i]) for i in top_indices]
+                    score_label = f"fused alpha={alpha:.1f}"
+
+                else:
+                    n_candidates = min(blip_candidates, len(gallery_embs))
+                    cand_indices = np.argsort(image_sims)[::-1][:n_candidates].tolist()
+
+                    if rerank_mode == "BLIP Text Similarity rerank":
+                        cand_text_embs = text_embs[cand_indices]
+                        rerank_sims = np.dot(cand_text_embs, q_img_emb.T).flatten()
+                        order = np.argsort(rerank_sims)[::-1][:top_k]
+                        top_indices = [cand_indices[i] for i in order]
+                        top_scores = [float(rerank_sims[i]) for i in order]
+                        score_label = "BLIP text cos"
+
+                    else:
+                        processor, itm_model = load_blip_itm()
+                        itm_scores = []
+                        for idx in cand_indices:
+                            caption = str(gallery_df.iloc[idx].get('clean_caption', ''))
+                            caption = get_caption(gallery_df.iloc[idx])
+                            inputs = processor(
+                                images=query_crop,
+                                text=caption,
+                                return_tensors="pt",
+                            )
+                            with torch.no_grad():
+                                out = itm_model(**inputs)
+                                score = out.itm_score.softmax(dim=1)[0, 1].item()
+                            itm_scores.append(float(score))
+                        order = np.argsort(itm_scores)[::-1][:top_k]
+                        top_indices = [cand_indices[i] for i in order]
+                        top_scores = [itm_scores[i] for i in order]
+                        score_label = "BLIP ITM"
 
             st.markdown("---")
-            st.header(f"Top {top_k} Results  ·  CLIP cosine similarity")
+            st.header(f"Top {top_k} Results · {condition}")
 
             img_dir = IMG_DIR if IMG_DIR else config.get('img_dir', '')
-            img_col = config.get('img_col', 'resolved_filename')
+            img_col = infer_image_column(gallery_df, config)
+            if img_col is None:
+                st.error(
+                    "Could not find an image filename/path column in the gallery CSV. "
+                    "Expected one of: resolved_filename, image_path, filename, file_name, path."
+                )
+                st.stop()
 
             cols_per_row = 5
             for row in range((top_k + cols_per_row - 1) // cols_per_row):
@@ -395,18 +626,18 @@ if uploaded is not None:
                     score    = top_scores[pos]
                     row_data = gallery_df.iloc[idx]
                     fname    = row_data[img_col]
-                    fpath    = fname if os.path.isabs(str(fname)) else os.path.join(img_dir, fname)
+                    fpath    = resolve_gallery_image_path(fname, img_dir)
 
                     with cols[c]:
                         if os.path.exists(fpath):
                             st.image(fpath, use_container_width=True)
                         else:
                             st.warning("🖼️ not found")
-                        st.write(f"**CLIP cos: {score:.4f}**")
-                        cap = row_data.get('clean_caption', '')
+                        st.write(f"**{score_label}: {score:.4f}**")
+                        cap = get_caption(row_data)
                         if cap:
                             st.caption(f"*{cap}*")
                         st.caption(f"ID: {row_data.get('item_id', 'N/A')}")
 
 st.markdown("---")
-st.caption("DeepFashion In-Shop Retrieval — CLIP Vision Search · YOLOv8x Region Detection")
+st.caption("DeepFashion In-Shop Retrieval — A/B/C CLIP + BLIP Search · YOLOv8x Region Detection")

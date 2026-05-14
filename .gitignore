@@ -1,10 +1,34 @@
+# macOS / Python
+.DS_Store
+__pycache__/
+*.py[cod]
 
-# Large model weights
+# Local environments
+visual_search/.conda/
+.venv/
+venv/
+
+# Large datasets and generated artifacts
+visual_search/data/
+visual_search/index/*.npy
+visual_search/index/*.zip
+visual_search/index/*.csv
+visual_search/index/blip_index/
+visual_search/captions*.csv
+BLIP_captions.csv
+
+# Model weights and checkpoints
 *.pt
 *.pth
+*.ckpt
 *.onnx
 *.bin
+*.safetensors
 
-# Plan files
+# Keep lightweight placeholders/configs trackable
+!visual_search/checkpoints/.gitkeep
+!visual_search/index/config.json
+
+# Local planning notes
 plan.md
 *.plan.md

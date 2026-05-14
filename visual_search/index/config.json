@@ -1,5 +1,5 @@
 {
-  "model": "ViT-L-14",
+  "model": "ViT-B-32",
   "pretrained": "openai",
   "alpha": 0.6,
   "rerank_alpha": 0.5,

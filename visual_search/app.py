@@ -243,11 +243,25 @@ if "yolo_conf" not in st.session_state:
     st.session_state.yolo_conf = 0.0
 if "selected_region" not in st.session_state:
     st.session_state.selected_region = None
+if "uploaded_file_id" not in st.session_state:
+    st.session_state.uploaded_file_id = None
 
 # ── Step 1 — Upload ───────────────────────────────────────────────────────────
 uploaded = st.file_uploader("Upload a clothing / person image", type=['jpg', 'jpeg', 'png'])
 
 if uploaded is not None:
+    # Build a unique ID for the current upload (name + size)
+    file_id = f"{uploaded.name}_{uploaded.size}"
+
+    # If the user uploaded a different file, reset all state
+    if st.session_state.uploaded_file_id != file_id:
+        st.session_state.uploaded_file_id = file_id
+        st.session_state.pil_img = None
+        st.session_state.regions = None
+        st.session_state.yolo_conf = 0.0
+        st.session_state.step = 1
+        st.session_state.selected_region = None
+
     fb      = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
     img_cv  = cv2.imdecode(fb, 1)
     img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)

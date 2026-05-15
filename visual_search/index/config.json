@@ -3,5 +3,16 @@
   "pretrained": "openai",
   "alpha": 0.6,
   "rerank_alpha": 0.5,
-  "rerank_k": 50
+  "rerank_k": 50,
+  "alpha_image": 0.7,
+  "alpha_text": 0.3,
+  "embedding_dim": 512,
+  "fused_dim": 512,
+  "num_indexed": 12612,
+  "index_type": "hnswlib_cosine",
+  "hnsw_index_file": "gallery_fused_hnsw.bin",
+  "fused_embeddings_file": "gallery_fused_embs.npy",
+  "hnsw_m": 32,
+  "hnsw_ef_construction": 200,
+  "hnsw_ef_search": 128
 }

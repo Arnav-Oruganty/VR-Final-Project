@@ -18,7 +18,7 @@ visual_search/captions*.csv
 BLIP_captions.csv
 
 # Model weights and checkpoints
-*.pt
+
 *.pth
 *.ckpt
 *.onnx

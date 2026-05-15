@@ -1,643 +1,370 @@
+import json
+import os
+from typing import List, Tuple
+
+import hnswlib
+import numpy as np
+import open_clip
+import pandas as pd
 import streamlit as st
 import torch
 import torch.nn.functional as F
-import open_clip
-import cv2
-import numpy as np
-import pandas as pd
-from PIL import Image, ImageDraw
-from ultralytics import YOLO
-import os
-import json
-
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Visual Product Search",
-    page_icon="🛍️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from PIL import Image, ImageDraw, ImageFont
+from transformers import (
+    AutoImageProcessor,
+    AutoModelForObjectDetection,
+    AutoProcessor,
+    Blip2ForImageTextRetrieval,
 )
-st.markdown("""
-<style>
-    body { background-color: #0e0e0e; }
-    .stButton>button {
-        width:100%; border-radius:8px; height:3em;
-        background: linear-gradient(135deg, #1a1a2e, #16213e);
-        color: white; font-weight: bold; border: 1px solid #444;
-        transition: all 0.2s;
-    }
-    .stButton>button:hover {
-        background: linear-gradient(135deg, #0f3460, #533483);
-        border-color: #7c6af7;
-    }
-    .badge {
-        display:inline-block; padding:3px 10px; border-radius:12px;
-        font-size:.8em; font-weight:bold; margin:2px;
-    }
-    .clip-b  { background:#0078d4; color:white; }
-    .step-pill {
-        display:inline-block;
-        background: #7c6af7;
-        color: white;
-        font-size: 0.75em;
-        font-weight: bold;
-        padding: 3px 12px;
-        border-radius: 20px;
-        margin-bottom: 8px;
-    }
-    .region-card {
-        border: 2px solid #333;
-        border-radius: 12px;
-        padding: 10px;
-        text-align: center;
-        background: #1a1a2e;
-        transition: border-color 0.2s;
-    }
-    .region-card:hover { border-color: #7c6af7; }
-    .region-card.selected { border-color: #00c896; }
-    .conf-badge {
-        display:inline-block;
-        padding: 2px 8px;
-        border-radius: 10px;
-        font-size: 0.75em;
-        font-weight: bold;
-        background: #1e3a2f;
-        color: #00c896;
-        border: 1px solid #00c896;
-        margin-top: 4px;
-    }
-    .search-btn>button {
-        background: linear-gradient(135deg, #ff4b4b, #d63031) !important;
-        border: none !important;
-        font-size: 1.1em !important;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 
-# ── YOLO Fashion Region Detector ──────────────────────────────────────────────
-REGION_CONFIG = {
-    "upper": {
-        "label": "Upper Body",
-        "icon": "👕",
-        "desc": "Tops, shirts, jackets, hoodies",
-        "color": (59, 130, 246),    # blue
-        "color_hex": "#3B82F6",
-        # YOLO class IDs to treat as upper body
-        "yolo_classes": {0},        # 'person' fallback handled separately
-    },
-    "lower": {
-        "label": "Lower Body",
-        "icon": "👖",
-        "desc": "Trousers, skirts, shorts",
-        "color": (34, 197, 94),     # green
-        "color_hex": "#22C55E",
-    },
-    "full": {
-        "label": "Full Body / Outfit",
-        "icon": "🧍",
-        "desc": "Dresses, jumpsuits, full look",
-        "color": (244, 63, 94),     # pink
-        "color_hex": "#F43F5E",
-    },
-}
-
-# Proportion of person bbox used to derive upper/lower/full crops
-SPLIT_RATIO = 0.52   # top 52% = upper, bottom 50% = lower
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+YOLOS_MODEL_ID = "valentinafevu/yolos-fashionpedia"
+BLIP2_ITM_MODEL_ID = "Salesforce/blip2-itm-vit-g"
+CLIP_MODEL_NAME = "ViT-L-14"
+CLIP_PRETRAINED = "openai"
+TOP_K_VALUES = (5, 10, 15)
+MAX_CANDIDATES = max(TOP_K_VALUES)
 
 
-def derive_garment_regions(person_box, img_w, img_h):
-    """
-    Given a person bounding box (x1,y1,x2,y2), derive three garment regions.
-    Returns dict: region_key -> (x1,y1,x2,y2)
-    """
-    x1, y1, x2, y2 = person_box
-    bw = x2 - x1
-    bh = y2 - y1
-
-    # Upper: top portion with slight horizontal padding
-    ux1 = max(0, x1 - int(bw * 0.03))
-    uy1 = max(0, y1)
-    ux2 = min(img_w, x2 + int(bw * 0.03))
-    uy2 = min(img_h, y1 + int(bh * SPLIT_RATIO))
-
-    # Lower: bottom portion
-    lx1 = max(0, x1 - int(bw * 0.03))
-    ly1 = max(0, y1 + int(bh * (SPLIT_RATIO - 0.10)))  # slight overlap
-    lx2 = min(img_w, x2 + int(bw * 0.03))
-    ly2 = min(img_h, y2)
-
-    # Full body = full person box with small padding
-    fx1 = max(0, x1 - int(bw * 0.05))
-    fy1 = max(0, y1 - int(bh * 0.02))
-    fx2 = min(img_w, x2 + int(bw * 0.05))
-    fy2 = min(img_h, y2 + int(bh * 0.02))
-
-    return {
-        "upper": (ux1, uy1, ux2, uy2),
-        "lower": (lx1, ly1, lx2, ly2),
-        "full":  (fx1, fy1, fx2, fy2),
-    }
+st.set_page_config(page_title="Visual Product Search", layout="wide")
+st.title("Visual Product Search")
+st.caption("Upload -> YOLOS detect/crop -> Confirm crop -> CLIP retrieval from fused HNSW -> BLIP-2 ITM rerank")
 
 
-def draw_regions_on_image(pil_img, regions, selected=None):
-    """Draw colored region boxes on a copy of pil_img."""
-    img = pil_img.copy().convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    for key, box in regions.items():
-        cfg = REGION_CONFIG[key]
-        r, g, b = cfg["color"]
-        is_sel = (key == selected)
-        alpha_fill = 60 if is_sel else 30
-        lw = 4 if is_sel else 2
-        draw.rectangle(box, fill=(r, g, b, alpha_fill), outline=(r, g, b, 220), width=lw)
-
-    result = Image.alpha_composite(img, overlay).convert("RGB")
-    return result
-
-
-# ── Loaders ───────────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_models(clip_model_name, clip_pretrained):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # YOLOv8x — best accuracy in the v8 family
-    # Falls back to yolov8n if x is not available (first run downloads it)
-    try:
-        yolo = YOLO("yolov8x.pt")
-    except Exception:
-        yolo = YOLO("yolov8n.pt")
-
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        clip_model_name, pretrained=clip_pretrained
-    )
-    tokenizer = open_clip.get_tokenizer(clip_model_name)
-    model.to(device).eval()
-    return yolo, model, preprocess, tokenizer, device
-
-
-@st.cache_resource
-def load_finetuned_clip(checkpoint_path, clip_model_name, clip_pretrained, device):
-    state = torch.load(checkpoint_path, map_location=device)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    elif isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
-
-    if any(k.startswith("vision_model.") for k in state):
-        from transformers import CLIPModel, CLIPProcessor
-        hf_model_id = "openai/clip-vit-base-patch32"
-        model = CLIPModel.from_pretrained(hf_model_id)
-        model.load_state_dict(state)
-        processor = CLIPProcessor.from_pretrained(hf_model_id)
-        model.to(device).eval()
-        return model, processor
-
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        clip_model_name, pretrained=clip_pretrained
-    )
-    model.load_state_dict(state)
-    model.to(device).eval()
-    return model, preprocess
-
-
-@st.cache_data
-def load_config(index_dir):
-    with open(os.path.join(index_dir, 'config.json')) as f:
-        return json.load(f)
-
-
-@st.cache_resource
-def load_index(index_dir, image_emb_file):
-    try:
-        clip_embs = np.load(os.path.join(index_dir, image_emb_file))
-        plain_csv = os.path.join(index_dir, 'gallery_index.csv')
-        blip_csv  = os.path.join(index_dir, 'gallery_index_blip.csv')
-        df = pd.read_csv(blip_csv if os.path.exists(blip_csv) else plain_csv)
-        with open(os.path.join(index_dir, 'config.json')) as f:
-            cfg = json.load(f)
-        return clip_embs, df, cfg
-    except Exception as e:
-        st.error(f"Error loading index: {e}")
-        return None, None, None
-
-
-@st.cache_resource
-def load_text_embs(index_dir):
-    path = os.path.join(index_dir, 'gallery_text_embs.npy')
-    if not os.path.exists(path):
-        return None
-    return np.load(path)
-
-
-@st.cache_resource
-def load_blip_itm():
-    from transformers import BlipForImageTextRetrieval, BlipProcessor
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-itm-base-coco")
-    model = BlipForImageTextRetrieval.from_pretrained("Salesforce/blip-itm-base-coco")
+def load_yolos():
+    processor = AutoImageProcessor.from_pretrained("valentinafevu/yolos-fashionpedia")
+    model = AutoModelForObjectDetection.from_pretrained(
+        "valentinafevu/yolos-fashionpedia"
+    ).to(DEVICE)
     model.eval()
     return processor, model
 
 
-def infer_image_column(df, config):
-    configured = config.get('img_col')
+@st.cache_resource
+def load_detection_model():
+    return load_yolos()
+
+
+def load_finetuned_clip_model(checkpoint_path: str):
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        CLIP_MODEL_NAME,
+        pretrained=CLIP_PRETRAINED,
+        device=DEVICE,
+    )
+    state = torch.load(checkpoint_path, map_location=DEVICE)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    if isinstance(state, dict):
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    return model, preprocess
+
+
+@st.cache_resource
+def load_clip(checkpoint_path: str):
+    return load_finetuned_clip_model(checkpoint_path)
+
+
+@st.cache_resource
+def load_itm_model():
+    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+    processor = AutoProcessor.from_pretrained(BLIP2_ITM_MODEL_ID)
+    model = Blip2ForImageTextRetrieval.from_pretrained(
+        BLIP2_ITM_MODEL_ID,
+        torch_dtype=dtype,
+    ).to(DEVICE)
+    model.eval()
+    return processor, model, dtype
+
+
+@st.cache_data
+def load_config(index_dir: str):
+    config_path = os.path.join(index_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Missing config: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@st.cache_data
+def load_gallery_df(index_dir: str):
+    csv_path = os.path.join(index_dir, "gallery_index_blip.csv")
+    if not os.path.exists(csv_path):
+        csv_path = os.path.join(index_dir, "gallery_index.csv")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError("Missing gallery_index_blip.csv / gallery_index.csv")
+    return pd.read_csv(csv_path)
+
+
+@st.cache_resource
+def load_hnsw_index(index_dir: str):
+    idx_path = os.path.join(index_dir, "gallery_fused_hnsw.bin")
+    if not os.path.exists(idx_path):
+        raise FileNotFoundError(
+            f"Missing HNSW index: {idx_path}. Run build_index.py once to create it."
+        )
+
+    config = load_config(index_dir)
+    dim = int(config.get("fused_dim", config.get("embedding_dim", 768)))
+    num_items = int(config.get("num_indexed", 0))
+    if num_items <= 0:
+        raise ValueError("config.json has invalid num_indexed; rebuild index.")
+
+    index = hnswlib.Index(space="cosine", dim=dim)
+    index.load_index(idx_path, max_elements=num_items)
+    return index
+
+
+def detect_fashion_objects(processor, model, image: Image.Image, threshold: float):
+    inputs = processor(images=image, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    result = processor.post_process_object_detection(
+        outputs,
+        threshold=threshold,
+        target_sizes=torch.tensor([image.size[::-1]], device=DEVICE),
+    )[0]
+
+    detections = []
+    width, height = image.size
+    for score, label_id, box in zip(result["scores"], result["labels"], result["boxes"]):
+        x1, y1, x2, y2 = box.detach().cpu().numpy().tolist()
+        x1 = int(max(0, min(width - 1, round(x1))))
+        y1 = int(max(0, min(height - 1, round(y1))))
+        x2 = int(max(1, min(width, round(x2))))
+        y2 = int(max(1, min(height, round(y2))))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        label_id = int(label_id.detach().cpu().item())
+        detections.append(
+            {
+                "label": model.config.id2label.get(label_id, str(label_id)),
+                "score": float(score.detach().cpu().item()),
+                "box": (x1, y1, x2, y2),
+            }
+        )
+
+    detections.sort(key=lambda d: d["score"], reverse=True)
+    for idx, det in enumerate(detections, 1):
+        det["idx"] = idx
+    return detections
+
+
+def draw_detections(image: Image.Image, detections, selected_idx: int):
+    annotated = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(annotated)
+    font = ImageFont.load_default()
+    for det in detections:
+        color = (0, 180, 120) if det["idx"] == selected_idx else (64, 120, 220)
+        x1, y1, x2, y2 = det["box"]
+        text = f'{det["idx"]}. {det["label"]} {det["score"]:.2f}'
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=4 if det["idx"] == selected_idx else 2)
+        draw.text((x1 + 3, max(0, y1 - 12)), text, fill=color, font=font)
+    return annotated
+
+
+def encode_image(model, preprocess, image: Image.Image) -> np.ndarray:
+    image_t = preprocess(image).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        emb = model.encode_image(image_t)
+    emb = F.normalize(emb.float(), dim=-1).cpu().numpy().astype("float32")
+    return emb
+
+
+def itm_scores(processor, model, dtype, query_image: Image.Image, captions: List[str]) -> np.ndarray:
+    clean = [c if isinstance(c, str) and c.strip() else "a clothing item" for c in captions]
+    inputs = processor(
+        images=[query_image] * len(clean),
+        text=clean,
+        return_tensors="pt",
+        padding=True,
+    )
+    inputs = {
+        key: value.to(DEVICE, dtype=dtype) if torch.is_floating_point(value) else value.to(DEVICE)
+        for key, value in inputs.items()
+    }
+    with torch.no_grad():
+        logits = model(**inputs)[0]
+    return F.softmax(logits.float(), dim=-1)[:, 1].cpu().numpy()
+
+
+def row_caption(row) -> str:
+    for col in ("caption", "clean_caption", "blip_caption"):
+        if col in row and pd.notna(row[col]) and str(row[col]).strip():
+            return str(row[col])
+    return "a clothing item"
+
+
+def infer_image_column(df: pd.DataFrame, config: dict):
+    configured = config.get("img_col")
     if configured in df.columns:
         return configured
-    for col in ('resolved_filename', 'image_path', 'filename', 'file_name', 'path'):
+    for col in ("filename", "cropped_image_path", "image_path", "file_name", "path"):
         if col in df.columns:
             return col
     return None
 
 
-def resolve_gallery_image_path(value, img_dir):
+def resolve_gallery_image_path(value: str, img_dir: str):
     value = str(value)
     if os.path.isabs(value) and os.path.exists(value):
         return value
-    local_path = os.path.join(img_dir, value)
-    if os.path.exists(local_path):
-        return local_path
+    joined = os.path.join(img_dir, value)
+    if os.path.exists(joined):
+        return joined
     return os.path.join(img_dir, os.path.basename(value))
 
 
-def get_caption(row_data):
-    for col in ('clean_caption', 'caption', 'blip_caption'):
-        if col in row_data and pd.notna(row_data[col]):
-            return str(row_data[col])
-    return ''
+def hnsw_retrieve(index, query_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    labels, distances = index.knn_query(query_emb, k=k)
+    # cosine distance -> similarity
+    sims = 1.0 - distances[0]
+    return labels[0], sims
 
 
-def encode_query_image(model, preprocess, pil_img, device):
-    if hasattr(model, "get_image_features"):
-        inputs = preprocess(images=pil_img, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        emb = model.get_image_features(**inputs)
-        if hasattr(emb, "image_embeds"):
-            emb = emb.image_embeds
-        elif hasattr(emb, "pooler_output"):
-            emb = emb.pooler_output
-    else:
-        img_t = preprocess(pil_img).unsqueeze(0).to(device)
-        emb = model.encode_image(img_t)
-    return F.normalize(emb.float(), dim=-1).cpu().numpy()
+st.sidebar.title("Settings")
+index_dir = st.sidebar.text_input("Index Directory", "./index")
+gallery_dir = st.sidebar.text_input("Gallery Images Directory", "./data/split_images/gallery")
+checkpoint_path = st.sidebar.text_input("Finetuned CLIP checkpoint", "./clip_finetuned.pt")
+det_threshold = st.sidebar.number_input("YOLOS confidence", 0.01, 0.99, 0.30, step=0.05)
 
-
-def run_yolo_person(yolo_model, img_rgb):
-    """Run YOLO and return the best person box (class 0)."""
-    results = yolo_model(img_rgb, verbose=False, classes=[0])[0]
-    boxes = results.boxes
-    if boxes is None or len(boxes) == 0:
-        return None, 0.0
-    confs = boxes.conf.cpu().numpy()
-    best_idx = int(np.argmax(confs))
-    box = boxes.xyxy[best_idx].cpu().numpy().astype(int).tolist()
-    conf = float(confs[best_idx])
-    return box, conf
-
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.title("⚙️ Settings")
-INDEX_DIR = st.sidebar.text_input("Index Directory", "./index")
-IMG_DIR   = st.sidebar.text_input("Images Directory", "./data/split_images/gallery")
-top_k     = st.sidebar.slider("Top-K results", 1, 20, 10)
-
-condition = st.sidebar.selectbox(
-    "Condition",
-    [
-        "A - Vision-only CLIP (frozen)",
-        "B - Frozen CLIP + BLIP captions",
-        "C - Fine-tuned CLIP + BLIP captions",
-    ],
-)
-rerank_mode = st.sidebar.selectbox(
-    "B/C retrieval mode",
-    ["Alpha fusion", "BLIP Text Similarity rerank", "BLIP ITM neural rerank"],
-    index=0,
-    disabled=condition.startswith("A"),
-)
-alpha = st.sidebar.slider(
-    "alpha image weight",
-    0.0,
-    1.0,
-    0.7,
-    step=0.1,
-    disabled=condition.startswith("A"),
-)
-blip_candidates = st.sidebar.slider(
-    "CLIP candidates to re-rank",
-    10,
-    200,
-    50,
-    disabled=condition.startswith("A") or rerank_mode == "Alpha fusion",
-)
-FINETUNED_CKPT = st.sidebar.text_input(
-    "Fine-tuned CLIP checkpoint",
-    "./checkpoints/clip_finetuned.pt",
-    disabled=not condition.startswith("C"),
-)
-
-# ── Title ─────────────────────────────────────────────────────────────────────
-st.title("🛍️ Visual Product Search")
-st.markdown("**DeepFashion In-Shop Retrieval · A/B/C Retrieval Demo**")
-st.markdown(f'<span class="badge clip-b">{condition}</span>', unsafe_allow_html=True)
-st.markdown("")
-
-# ── Load models & index ───────────────────────────────────────────────────────
-if not os.path.exists(INDEX_DIR):
-    st.warning(f"⚠️ Index directory '{INDEX_DIR}' not found.")
+if not os.path.exists(checkpoint_path):
+    st.error(f"Missing finetuned checkpoint: {checkpoint_path}")
     st.stop()
 
 try:
-    base_config = load_config(INDEX_DIR)
-except Exception as e:
-    st.error(f"Error loading config.json: {e}")
+    config = load_config(index_dir)
+    gallery_df = load_gallery_df(index_dir)
+    hnsw_index = load_hnsw_index(index_dir)
+except Exception as exc:
+    st.error(str(exc))
     st.stop()
 
-clip_model_name = base_config.get("model", "ViT-B-32")
-clip_pretrained = base_config.get("pretrained", "openai")
+expected_alpha_img = float(config.get("alpha_image", 0.7))
+expected_alpha_text = float(config.get("alpha_text", 0.3))
+st.sidebar.caption(f"Fused index weights: image={expected_alpha_img:.1f}, text={expected_alpha_text:.1f}")
 
-with st.spinner(f"Loading {clip_model_name} + YOLOv8x..."):
-    yolo_model, clip_model, clip_preprocess, clip_tokenizer, clip_device = load_models(
-        clip_model_name,
-        clip_pretrained,
-    )
+with st.spinner("Loading YOLOS, finetuned CLIP, and BLIP-2 ITM..."):
+    yolo_processor, yolo_model = load_detection_model()
+    clip_model, clip_preprocess = load_clip(checkpoint_path)
+    itm_processor, itm_model, itm_dtype = load_itm_model()
 
-image_emb_file = 'gallery_embs_finetuned.npy' if condition.startswith("C") else 'gallery_embs.npy'
-image_emb_path = os.path.join(INDEX_DIR, image_emb_file)
-if not os.path.exists(image_emb_path):
-    st.error(
-        f"Missing `{image_emb_path}`. Upload `{image_emb_file}` into `{INDEX_DIR}` "
-        "before using this condition."
-    )
+for key, default in {
+    "upload_id": None,
+    "image": None,
+    "detections": [],
+    "selected_idx": None,
+    "crop_confirmed": False,
+    "results": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+uploaded = st.file_uploader("Upload input image", type=["jpg", "jpeg", "png"])
+if uploaded is None:
+    st.info("Upload an image to begin.")
     st.stop()
 
-if condition.startswith("C"):
-    if not os.path.exists(FINETUNED_CKPT):
-        st.error(
-            f"Missing `{FINETUNED_CKPT}`. Upload your fine-tuned CLIP checkpoint there "
-            "so the query image uses the same encoder as the fine-tuned gallery index."
-        )
-        st.stop()
-    with st.spinner("Loading fine-tuned CLIP checkpoint..."):
-        clip_model, clip_preprocess = load_finetuned_clip(
-            FINETUNED_CKPT,
-            clip_model_name,
-            clip_pretrained,
-            clip_device,
-        )
+upload_id = f"{uploaded.name}:{uploaded.size}:{det_threshold:.2f}"
+if st.session_state.upload_id != upload_id:
+    image = Image.open(uploaded).convert("RGB")
+    with st.spinner("Running YOLOS detection..."):
+        detections = detect_fashion_objects(yolo_processor, yolo_model, image, det_threshold)
+    st.session_state.upload_id = upload_id
+    st.session_state.image = image
+    st.session_state.detections = detections
+    st.session_state.selected_idx = detections[0]["idx"] if detections else None
+    st.session_state.crop_confirmed = False
+    st.session_state.results = None
 
-gallery_embs, gallery_df, config = load_index(INDEX_DIR, image_emb_file)
-if gallery_embs is None:
+image = st.session_state.image
+detections = st.session_state.detections
+if not detections:
+    st.error("No YOLOS garment detections. Lower confidence or try another image.")
     st.stop()
 
-text_embs = None
-if not condition.startswith("A"):
-    text_embs = load_text_embs(INDEX_DIR)
-    if text_embs is None:
-        st.error(
-            f"Missing `{os.path.join(INDEX_DIR, 'gallery_text_embs.npy')}`. "
-            "Upload it before using Condition B or C."
-        )
-        st.stop()
-    if len(text_embs) != len(gallery_embs):
-        st.error(
-            "Gallery image embeddings and gallery text embeddings have different lengths. "
-            "Rebuild or upload matching index files."
-        )
-        st.stop()
+left, right = st.columns([1.4, 1])
+with left:
+    st.subheader("Detected objects")
+    st.image(draw_detections(image, detections, st.session_state.selected_idx), use_container_width=True)
 
-st.sidebar.success(f"✅ {len(gallery_embs):,} image embeddings loaded")
-if text_embs is not None:
-    st.sidebar.success(f"✅ {len(text_embs):,} text embeddings loaded")
+with right:
+    labels = [f'{d["idx"]}. {d["label"]} (conf {d["score"]:.3f})' for d in detections]
+    selected_label = st.radio("Choose crop", labels)
+    selected_idx = int(selected_label.split(".", 1)[0])
+    if selected_idx != st.session_state.selected_idx:
+        st.session_state.selected_idx = selected_idx
+        st.session_state.crop_confirmed = False
+        st.session_state.results = None
+        st.rerun()
 
-# ── Session state ─────────────────────────────────────────────────────────────
-if "step" not in st.session_state:
-    st.session_state.step = 1          # 1 = upload, 2 = choose region, 3 = results
-if "regions" not in st.session_state:
-    st.session_state.regions = None
-if "pil_img" not in st.session_state:
-    st.session_state.pil_img = None
-if "yolo_conf" not in st.session_state:
-    st.session_state.yolo_conf = 0.0
-if "selected_region" not in st.session_state:
-    st.session_state.selected_region = None
-if "uploaded_file_id" not in st.session_state:
-    st.session_state.uploaded_file_id = None
+selected = next(d for d in detections if d["idx"] == st.session_state.selected_idx)
+query_crop = image.crop(selected["box"])
 
-# ── Step 1 — Upload ───────────────────────────────────────────────────────────
-uploaded = st.file_uploader("Upload a clothing / person image", type=['jpg', 'jpeg', 'png'])
+c1, c2 = st.columns([1, 1])
+with c1:
+    st.image(query_crop, caption=f'{selected["label"]} | conf {selected["score"]:.3f}', width=280)
+with c2:
+    confirm_col, recrop_col = st.columns(2)
+    if confirm_col.button("Confirm crop", type="primary"):
+        st.session_state.crop_confirmed = True
+        st.session_state.results = None
+        st.rerun()
+    if recrop_col.button("Re-crop"):
+        st.session_state.crop_confirmed = False
+        st.session_state.results = None
+        st.rerun()
 
-if uploaded is not None:
-    # Build a unique ID for the current upload (name + size)
-    file_id = f"{uploaded.name}_{uploaded.size}"
+if not st.session_state.crop_confirmed:
+    st.info("Confirm crop before retrieval.")
+    st.stop()
 
-    # If the user uploaded a different file, reset all state
-    if st.session_state.uploaded_file_id != file_id:
-        st.session_state.uploaded_file_id = file_id
-        st.session_state.pil_img = None
-        st.session_state.regions = None
-        st.session_state.yolo_conf = 0.0
-        st.session_state.step = 1
-        st.session_state.selected_region = None
+if st.button("Retrieve Top K and Re-rank", type="primary"):
+    with st.spinner("Encoding crop, retrieving with HNSW cosine search, and ITM re-ranking..."):
+        query_emb = encode_image(clip_model, clip_preprocess, query_crop)
+        idxs, sims = hnsw_retrieve(hnsw_index, query_emb, MAX_CANDIDATES)
 
-    fb      = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
-    img_cv  = cv2.imdecode(fb, 1)
-    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
-    h, w    = img_rgb.shape[:2]
+        candidate_rows = gallery_df.iloc[idxs]
+        candidate_captions = [row_caption(row) for _, row in candidate_rows.iterrows()]
+        itm = itm_scores(itm_processor, itm_model, itm_dtype, query_crop, candidate_captions)
 
-    # Auto-detect on new upload
-    if st.session_state.pil_img is None or st.session_state.step == 1:
-        with st.spinner("Detecting person with YOLOv8x…"):
-            person_box, yolo_conf = run_yolo_person(yolo_model, img_rgb)
-
-        if person_box is not None:
-            regions = derive_garment_regions(person_box, w, h)
-        else:
-            # No person detected → use heuristic splits on full image
-            regions = derive_garment_regions([0, 0, w, h], w, h)
-            yolo_conf = 0.0
-
-        st.session_state.pil_img   = pil_img
-        st.session_state.regions   = regions
-        st.session_state.yolo_conf = yolo_conf
-        st.session_state.step      = 2
-        st.session_state.selected_region = None
-
-    pil_img = st.session_state.pil_img
-    regions = st.session_state.regions
-    yolo_conf = st.session_state.yolo_conf
-
-    # ── Step 2 — Region selection ──────────────────────────────────────────────
-    if st.session_state.step >= 2:
-        st.markdown('<div class="step-pill">Step 2 · Choose which garment region to search</div>', unsafe_allow_html=True)
-
-        left_col, right_col = st.columns([1, 2])
-
-        with left_col:
-            st.subheader("All detected regions")
-            annotated = draw_regions_on_image(pil_img, regions, st.session_state.selected_region)
-            st.image(annotated, use_container_width=True)
-            conf_color = "#00c896" if yolo_conf > 0.5 else "#facc15"
-            st.markdown(
-                f'🔵 Upper &nbsp; 🟢 Lower &nbsp; 🩷 Full body &nbsp;|&nbsp; '
-                f'YOLO: <span style="color:{conf_color};font-weight:bold">{yolo_conf:.3f} ↑</span>',
-                unsafe_allow_html=True
+        ranked = []
+        for pos, (idx, clip_score, itm_score) in enumerate(zip(idxs, sims, itm), 1):
+            ranked.append(
+                {
+                    "index": int(idx),
+                    "clip_score": float(clip_score),
+                    "itm_score": float(itm_score),
+                    "initial_rank": pos,
+                }
             )
 
-        with right_col:
-            st.subheader("Select the region you want to search for:")
-            r1, r2, r3 = st.columns(3)
+        st.session_state.results = ranked
 
-            for col, rkey in zip([r1, r2, r3], ["upper", "lower", "full"]):
-                cfg = REGION_CONFIG[rkey]
-                box = regions[rkey]
-                crop = pil_img.crop(box)
+if st.session_state.results:
+    img_col = infer_image_column(gallery_df, config)
+    if img_col is None:
+        st.error("Could not infer image column from gallery CSV.")
+        st.stop()
 
-                with col:
-                    is_sel = (st.session_state.selected_region == rkey)
-                    border_col = "#00c896" if is_sel else cfg["color_hex"]
-                    st.markdown(
-                        f'<div style="border:2px solid {border_col};border-radius:12px;padding:6px;text-align:center;">',
-                        unsafe_allow_html=True
-                    )
-                    st.image(crop, use_container_width=True)
-                    st.markdown(
-                        f'<div style="color:{cfg["color_hex"]};font-size:1.4em;margin-top:4px;">{cfg["icon"]}</div>'
-                        f'<div style="font-weight:bold;">{cfg["label"]}</div>'
-                        f'<div style="font-size:0.8em;color:#aaa;">{cfg["desc"]}</div>'
-                        f'<div class="conf-badge">conf {yolo_conf:.3f}</div>',
-                        unsafe_allow_html=True
-                    )
-                    st.markdown('</div>', unsafe_allow_html=True)
-
-                    if st.button(f"Select", key=f"sel_{rkey}"):
-                        st.session_state.selected_region = rkey
-                        st.session_state.step = 3
-                        st.rerun()
-
-        # hint
-        if st.session_state.selected_region is None:
-            st.info("👆 Click one of the three region buttons above to continue.")
-
-    # ── Step 3 — Search ────────────────────────────────────────────────────────
-    if st.session_state.step == 3 and st.session_state.selected_region is not None:
-        rkey  = st.session_state.selected_region
-        cfg   = REGION_CONFIG[rkey]
-        box   = regions[rkey]
-        query_crop = pil_img.crop(box)
-
-        st.markdown("---")
-        st.markdown(
-            f'<div class="step-pill">Step 3 · Searching for {cfg["icon"]} {cfg["label"]}</div>',
-            unsafe_allow_html=True
-        )
-
-        col_q, col_btn = st.columns([3, 1])
-        with col_q:
-            st.image(query_crop, caption=f"Query crop: {cfg['label']}", width=220)
-        with col_btn:
-            st.markdown('<div class="search-btn">', unsafe_allow_html=True)
-            do_search = st.button("🔍 Search")
-            st.markdown('</div>', unsafe_allow_html=True)
-            if st.button("← Change region"):
-                st.session_state.step = 2
-                st.session_state.selected_region = None
-                st.rerun()
-
-        if do_search:
-            with st.spinner("Encoding query and retrieving candidates..."):
-                with torch.no_grad():
-                    q_img_emb = encode_query_image(
-                        clip_model,
-                        clip_preprocess,
-                        query_crop,
-                        clip_device,
-                    )
-
-                image_sims = np.dot(gallery_embs, q_img_emb.T).flatten()
-
-                if condition.startswith("A"):
-                    final_sims = image_sims
-                    top_indices = np.argsort(final_sims)[::-1][:top_k].tolist()
-                    top_scores = [float(final_sims[i]) for i in top_indices]
-                    score_label = "CLIP cos"
-
-                elif rerank_mode == "Alpha fusion":
-                    text_sims = np.dot(text_embs, q_img_emb.T).flatten()
-                    final_sims = alpha * image_sims + (1.0 - alpha) * text_sims
-                    top_indices = np.argsort(final_sims)[::-1][:top_k].tolist()
-                    top_scores = [float(final_sims[i]) for i in top_indices]
-                    score_label = f"fused alpha={alpha:.1f}"
-
-                else:
-                    n_candidates = min(blip_candidates, len(gallery_embs))
-                    cand_indices = np.argsort(image_sims)[::-1][:n_candidates].tolist()
-
-                    if rerank_mode == "BLIP Text Similarity rerank":
-                        cand_text_embs = text_embs[cand_indices]
-                        rerank_sims = np.dot(cand_text_embs, q_img_emb.T).flatten()
-                        order = np.argsort(rerank_sims)[::-1][:top_k]
-                        top_indices = [cand_indices[i] for i in order]
-                        top_scores = [float(rerank_sims[i]) for i in order]
-                        score_label = "BLIP text cos"
-
+    tabs = st.tabs([f"Top {k}" for k in TOP_K_VALUES])
+    for tab, k in zip(tabs, TOP_K_VALUES):
+        with tab:
+            subset = sorted(st.session_state.results[:k], key=lambda r: r["itm_score"], reverse=True)
+            cols = st.columns(5)
+            for rank, item in enumerate(subset, 1):
+                row = gallery_df.iloc[item["index"]]
+                fpath = resolve_gallery_image_path(row[img_col], gallery_dir)
+                with cols[(rank - 1) % 5]:
+                    if os.path.exists(fpath):
+                        st.image(fpath, use_container_width=True)
                     else:
-                        processor, itm_model = load_blip_itm()
-                        itm_scores = []
-                        for idx in cand_indices:
-                            caption = str(gallery_df.iloc[idx].get('clean_caption', ''))
-                            caption = get_caption(gallery_df.iloc[idx])
-                            inputs = processor(
-                                images=query_crop,
-                                text=caption,
-                                return_tensors="pt",
-                            )
-                            with torch.no_grad():
-                                out = itm_model(**inputs)
-                                score = out.itm_score.softmax(dim=1)[0, 1].item()
-                            itm_scores.append(float(score))
-                        order = np.argsort(itm_scores)[::-1][:top_k]
-                        top_indices = [cand_indices[i] for i in order]
-                        top_scores = [itm_scores[i] for i in order]
-                        score_label = "BLIP ITM"
-
-            st.markdown("---")
-            st.header(f"Top {top_k} Results · {condition}")
-
-            img_dir = IMG_DIR if IMG_DIR else config.get('img_dir', '')
-            img_col = infer_image_column(gallery_df, config)
-            if img_col is None:
-                st.error(
-                    "Could not find an image filename/path column in the gallery CSV. "
-                    "Expected one of: resolved_filename, image_path, filename, file_name, path."
-                )
-                st.stop()
-
-            cols_per_row = 5
-            for row in range((top_k + cols_per_row - 1) // cols_per_row):
-                cols = st.columns(cols_per_row)
-                for c in range(cols_per_row):
-                    pos = row * cols_per_row + c
-                    if pos >= len(top_indices):
-                        break
-                    idx      = top_indices[pos]
-                    score    = top_scores[pos]
-                    row_data = gallery_df.iloc[idx]
-                    fname    = row_data[img_col]
-                    fpath    = resolve_gallery_image_path(fname, img_dir)
-
-                    with cols[c]:
-                        if os.path.exists(fpath):
-                            st.image(fpath, use_container_width=True)
-                        else:
-                            st.warning("🖼️ not found")
-                        st.write(f"**{score_label}: {score:.4f}**")
-                        cap = get_caption(row_data)
-                        if cap:
-                            st.caption(f"*{cap}*")
-                        st.caption(f"ID: {row_data.get('item_id', 'N/A')}")
-
-st.markdown("---")
-st.caption("DeepFashion In-Shop Retrieval — A/B/C CLIP + BLIP Search · YOLOv8x Region Detection")
+                        st.warning("image not found")
+                    st.write(f"**Final rank #{rank}**")
+                    st.caption(f"ITM: {item['itm_score']:.4f}")
+                    st.caption(f"HNSW cosine: {item['clip_score']:.4f} | initial #{item['initial_rank']}")
+                    st.caption(row_caption(row))

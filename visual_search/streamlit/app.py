@@ -1,6 +1,10 @@
+import base64
+import html
+import io
 import json
 import os
 import pickle
+from pathlib import Path
 from typing import List, Tuple
 
 import hnswlib
@@ -22,15 +26,113 @@ from transformers import (
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 YOLOS_MODEL_ID = "valentinafevu/yolos-fashionpedia"
 BLIP2_ITM_MODEL_ID = "Salesforce/blip2-itm-vit-g"
-CLIP_MODEL_NAME = "ViT-B-32"
+CLIP_MODEL_NAME = "ViT-L-14"
 CLIP_PRETRAINED = "openai"
 TOP_K_VALUES = (5, 10, 15)
 MAX_CANDIDATES = max(TOP_K_VALUES)
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_INDEX_DIR = PROJECT_DIR / "index"
 
 
 st.set_page_config(page_title="Visual Product Search", layout="wide")
 st.title("Visual Product Search")
 st.caption("Upload -> YOLOS detect/crop -> Confirm crop -> CLIP retrieval from fused HNSW -> BLIP-2 ITM rerank")
+
+st.markdown(
+    """
+    <style>
+    .result-card {
+        display: grid;
+        grid-template-columns: 184px minmax(0, 1fr);
+        gap: 18px;
+        align-items: stretch;
+        padding: 14px;
+        margin: 0 0 14px 0;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.28);
+    }
+    .result-image-frame {
+        width: 184px;
+        height: 224px;
+        border-radius: 6px;
+        background: #f8fafc;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .result-image-frame img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+    }
+    .result-title {
+        font-size: 1rem;
+        font-weight: 700;
+        line-height: 1.2;
+        margin-bottom: 6px;
+    }
+    .result-caption {
+        font-size: 0.88rem;
+        line-height: 1.35;
+        margin: 8px 0 10px 0;
+        color: rgba(226, 232, 240, 0.92);
+    }
+    .result-meta {
+        font-size: 0.72rem;
+        line-height: 1.35;
+        color: rgba(148, 163, 184, 0.95);
+        word-break: break-word;
+    }
+    .score-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(110px, 1fr));
+        gap: 8px;
+        margin-top: 12px;
+        max-width: 340px;
+    }
+    .score-box {
+        border-top: 1px solid rgba(148, 163, 184, 0.22);
+        padding-top: 7px;
+    }
+    .score-label {
+        display: block;
+        font-size: 0.68rem;
+        color: rgba(148, 163, 184, 0.95);
+        margin-bottom: 2px;
+    }
+    .score-value {
+        display: block;
+        font-size: 1.02rem;
+        font-weight: 700;
+        color: #f8fafc;
+        font-variant-numeric: tabular-nums;
+    }
+    .missing-image {
+        color: #64748b;
+        font-size: 0.78rem;
+    }
+    @media (max-width: 720px) {
+        .result-card {
+            grid-template-columns: 128px minmax(0, 1fr);
+            gap: 12px;
+            padding: 10px;
+        }
+        .result-image-frame {
+            width: 128px;
+            height: 168px;
+        }
+        .score-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def load_yolos():
@@ -47,13 +149,15 @@ def load_detection_model():
     return load_yolos()
 
 
-def load_finetuned_clip_model(checkpoint_path: str):
+def load_finetuned_clip_model(checkpoint_path: str, model_name: str, pretrained: str):
     model, _, preprocess = open_clip.create_model_and_transforms(
-        CLIP_MODEL_NAME,
-        pretrained=CLIP_PRETRAINED,
+        model_name,
+        pretrained=pretrained,
         device=DEVICE,
     )
     state = torch.load(checkpoint_path, map_location=DEVICE)
+    if isinstance(state, dict) and "model_state" in state:
+        state = state["model_state"]
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     if isinstance(state, dict) and "model_state_dict" in state:
@@ -66,8 +170,8 @@ def load_finetuned_clip_model(checkpoint_path: str):
 
 
 @st.cache_resource
-def load_clip(checkpoint_path: str):
-    return load_finetuned_clip_model(checkpoint_path)
+def load_clip(checkpoint_path: str, model_name: str, pretrained: str):
+    return load_finetuned_clip_model(checkpoint_path, model_name, pretrained)
 
 
 @st.cache_resource
@@ -104,7 +208,7 @@ def load_gallery_df(index_dir: str):
         if isinstance(payload, pd.DataFrame):
             return add_derived_metadata(payload)
 
-    csv_path = os.path.join(index_dir, "gallery_index_blip.csv")
+    csv_path = config.get("captions_csv") or os.path.join(index_dir, "gallery_index_blip.csv")
     if not os.path.exists(csv_path):
         csv_path = os.path.join(index_dir, "gallery_index.csv")
     if not os.path.exists(csv_path):
@@ -121,13 +225,13 @@ def add_derived_metadata(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_resource
 def load_hnsw_index(index_dir: str):
-    idx_path = os.path.join(index_dir, "gallery_fused_hnsw.bin")
+    config = load_config(index_dir)
+    idx_path = os.path.join(index_dir, config.get("hnsw_index_file", "gallery_fused_hnsw.bin"))
     if not os.path.exists(idx_path):
         raise FileNotFoundError(
             f"Missing HNSW index: {idx_path}. Run build_index.py once to create it."
         )
 
-    config = load_config(index_dir)
     dim = int(config.get("fused_dim", config.get("embedding_dim", 768)))
     num_items = int(config.get("num_indexed", 0))
     if num_items <= 0:
@@ -207,8 +311,8 @@ def itm_scores(processor, model, dtype, query_image: Image.Image, captions: List
         for key, value in inputs.items()
     }
     with torch.no_grad():
-        logits = model(**inputs)[0]
-    return F.softmax(logits.float(), dim=-1)[:, 1].cpu().numpy()
+        outputs = model(**inputs, use_image_text_matching_head=True)
+    return F.softmax(outputs.logits_per_image.float(), dim=1)[:, 1].cpu().numpy()
 
 
 def row_caption(row) -> str:
@@ -248,6 +352,48 @@ def resolve_display_image_path(row, img_col: str, gallery_dir: str, original_dir
     return resolve_gallery_image_path(source_value, gallery_dir), "gallery"
 
 
+def image_data_uri(path: str) -> str:
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=88)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def render_result_card(item: dict, caption: str, image_path: str, image_source: str, original_name: str):
+    if os.path.exists(image_path):
+        image_html = f'<img src="{image_data_uri(image_path)}" alt="{html.escape(str(original_name))}">'
+    else:
+        image_html = '<span class="missing-image">Image not found</span>'
+
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="result-image-frame">{image_html}</div>
+            <div>
+                <div class="result-title">Rank {item["final_rank"]}</div>
+                <div class="result-meta">Item ID: {item["index"]} | HNSW rank before BLIP-2: {item["pre_rerank_rank"]}</div>
+                <div class="result-meta">File: {html.escape(str(original_name))}</div>
+                <div class="result-meta">Image source: {html.escape(str(image_source))}</div>
+                <div class="result-caption">{html.escape(str(caption))}</div>
+                <div class="score-grid">
+                    <div class="score-box">
+                        <span class="score-label">CLIP/HNSW similarity</span>
+                        <span class="score-value">{item["clip_score"]:.4f}</span>
+                    </div>
+                    <div class="score-box">
+                        <span class="score-label">BLIP-2 match score</span>
+                        <span class="score-value">{item["itm_score"]:.4f}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def hnsw_retrieve(index, query_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     labels, distances = index.knn_query(query_emb, k=k)
     # cosine distance -> similarity
@@ -256,16 +402,8 @@ def hnsw_retrieve(index, query_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.
 
 
 st.sidebar.title("Settings")
-index_dir = st.sidebar.text_input("Index Directory", "./index")
-gallery_dir = st.sidebar.text_input("Gallery Images Directory", "./data/split_images/gallery")
-original_dir = st.sidebar.text_input("Original Images Directory (optional)", "")
-checkpoint_path = st.sidebar.text_input("Finetuned CLIP checkpoint", "./clip_finetuned.pt")
+index_dir = st.sidebar.text_input("Index Directory", str(DEFAULT_INDEX_DIR))
 det_threshold = st.sidebar.number_input("YOLOS confidence", 0.01, 0.99, 0.30, step=0.05)
-st.sidebar.caption("Leave Original Images Directory blank for now; when you share the folder, matching filenames will be loaded from there.")
-
-if not os.path.exists(checkpoint_path):
-    st.error(f"Missing finetuned checkpoint: {checkpoint_path}")
-    st.stop()
 
 try:
     config = load_config(index_dir)
@@ -275,13 +413,31 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-expected_alpha_img = float(config.get("alpha_image", 0.7))
-expected_alpha_text = float(config.get("alpha_text", 0.3))
+gallery_dir = st.sidebar.text_input(
+    "Gallery Images Directory",
+    config.get("gallery_dir", "./data/split_images/gallery"),
+)
+original_dir = st.sidebar.text_input("Original Images Directory (optional)", "")
+checkpoint_path = st.sidebar.text_input(
+    "Finetuned CLIP checkpoint",
+    config.get("checkpoint_path", "./clip-model/clip_finetuned.pt"),
+)
+st.sidebar.caption("Leave Original Images Directory blank for now; when you share the folder, matching filenames will be loaded from there.")
+
+if not os.path.exists(checkpoint_path):
+    st.error(f"Missing finetuned checkpoint: {checkpoint_path}")
+    st.stop()
+
+expected_alpha_img = float(config.get("alpha_image", 0.8))
+expected_alpha_text = float(config.get("alpha_text", 0.2))
+clip_model_name = config.get("model", CLIP_MODEL_NAME)
+clip_pretrained = config.get("pretrained", CLIP_PRETRAINED)
 st.sidebar.caption(f"Fused index weights: image={expected_alpha_img:.1f}, text={expected_alpha_text:.1f}")
+st.sidebar.caption(f"CLIP model: {clip_model_name}")
 
 with st.spinner("Loading YOLOS, finetuned CLIP, and BLIP-2 ITM..."):
     yolo_processor, yolo_model = load_detection_model()
-    clip_model, clip_preprocess = load_clip(checkpoint_path)
+    clip_model, clip_preprocess = load_clip(checkpoint_path, clip_model_name, clip_pretrained)
     itm_processor, itm_model, itm_dtype = load_itm_model()
 
 for key, default in {
@@ -358,21 +514,25 @@ if st.button("Retrieve Top K and Re-rank", type="primary"):
     with st.spinner("Encoding crop, retrieving with HNSW cosine search, and ITM re-ranking..."):
         query_emb = encode_image(clip_model, clip_preprocess, query_crop)
         idxs, sims = hnsw_retrieve(hnsw_index, query_emb, MAX_CANDIDATES)
+        pre_rerank_rank = {int(idx): rank for rank, idx in enumerate(idxs, 1)}
 
         candidate_rows = gallery_df.iloc[idxs]
         candidate_captions = [row_caption(row) for _, row in candidate_rows.iterrows()]
         itm = itm_scores(itm_processor, itm_model, itm_dtype, query_crop, candidate_captions)
 
-        ranked = []
-        for pos, (idx, clip_score, itm_score) in enumerate(zip(idxs, sims, itm), 1):
-            ranked.append(
+        candidates = []
+        for idx, clip_score, itm_score in zip(idxs, sims, itm):
+            candidates.append(
                 {
                     "index": int(idx),
                     "clip_score": float(clip_score),
                     "itm_score": float(itm_score),
-                    "initial_rank": pos,
+                    "pre_rerank_rank": pre_rerank_rank[int(idx)],
                 }
             )
+        ranked = sorted(candidates, key=lambda r: r["itm_score"], reverse=True)
+        for final_rank, item in enumerate(ranked, 1):
+            item["final_rank"] = final_rank
 
         st.session_state.results = ranked
 
@@ -385,22 +545,10 @@ if st.session_state.results:
     tabs = st.tabs([f"Top {k}" for k in TOP_K_VALUES])
     for tab, k in zip(tabs, TOP_K_VALUES):
         with tab:
-            subset = sorted(st.session_state.results[:k], key=lambda r: r["itm_score"], reverse=True)
-            for rank, item in enumerate(subset, 1):
+            subset = st.session_state.results[:k]
+            for item in subset:
                 row = gallery_df.iloc[item["index"]]
                 fpath, image_source = resolve_display_image_path(row, img_col, gallery_dir, original_dir)
                 caption = row_caption(row)
                 original_name = row.get("original_file_name", os.path.basename(str(row[img_col])))
-                image_col, detail_col = st.columns([0.25, 0.75])
-                with image_col:
-                    if os.path.exists(fpath):
-                        st.image(fpath, use_container_width=True)
-                    else:
-                        st.warning("image not found")
-                with detail_col:
-                    st.write(f"**Final rank #{rank}**")
-                    st.write(caption)
-                    st.caption(f"File: {original_name}")
-                    st.caption(f"Image source: {image_source}")
-                    st.caption(f"ITM: {item['itm_score']:.4f}")
-                    st.caption(f"HNSW cosine: {item['clip_score']:.4f} | initial #{item['initial_rank']}")
+                render_result_card(item, caption, fpath, image_source, original_name)

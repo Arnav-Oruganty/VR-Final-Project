@@ -10,9 +10,8 @@ venv/
 
 # Large datasets and generated artifacts
 visual_search/data/
-visual_search/index/*.npy
+visual_search/index/.npy
 visual_search/index/*.zip
-visual_search/index/blip_index/
 visual_search/captions*.csv
 
 visual_search/clip-model/clip_finetuned.pt

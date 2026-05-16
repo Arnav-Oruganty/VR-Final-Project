@@ -1,19 +1,28 @@
 {
-  "model": "ViT-B-32",
+  "gallery_dir": "C:\\Users\\ankit\\Desktop\\VR-Final-Project\\visual_search\\data\\split_images\\gallery",
+  "captions_csv": "C:\\Users\\ankit\\Desktop\\VR-Final-Project\\visual_search\\captions\\gallery_index_blip.csv",
+  "checkpoint_path": "C:\\Users\\ankit\\Desktop\\VR-Final-Project\\visual_search\\clip-model\\clip_finetuned.pt",
+  "model": "ViT-L-14",
   "pretrained": "openai",
-  "alpha": 0.6,
-  "rerank_alpha": 0.5,
-  "rerank_k": 50,
-  "alpha_image": 0.7,
-  "alpha_text": 0.3,
-  "embedding_dim": 512,
-  "fused_dim": 512,
+  "alpha_image": 0.8,
+  "alpha_text": 0.2,
+  "embedding_dim": 768,
+  "fused_dim": 768,
   "num_indexed": 12612,
+  "top_k_values": [
+    5,
+    10,
+    15
+  ],
   "index_type": "hnswlib_cosine",
   "hnsw_index_file": "gallery_fused_hnsw.bin",
+  "image_embeddings_file": "gallery_embs_finetuned.npy",
+  "text_embeddings_file": "gallery_text_embs.npy",
   "fused_embeddings_file": "gallery_fused_embs.npy",
+  "metadata_file": "gallery_metadata.pkl",
+  "metadata_source_file": "gallery_index_blip.csv",
+  "itm_model": "Salesforce/blip2-itm-vit-g",
   "hnsw_m": 32,
   "hnsw_ef_construction": 200,
-  "hnsw_ef_search": 128,
-  "metadata_file": "gallery_metadata.pkl"
+  "hnsw_ef_search": 128
 }

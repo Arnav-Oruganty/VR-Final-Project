@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import pickle
 
 import hnswlib
 import numpy as np
@@ -22,6 +23,15 @@ def load_gallery_metadata(index_dir: str) -> pd.DataFrame:
     if not os.path.exists(csv_path):
         raise FileNotFoundError("Missing gallery_index_blip.csv / gallery_index.csv")
     return pd.read_csv(csv_path)
+
+
+def add_derived_metadata(gallery_df: pd.DataFrame) -> pd.DataFrame:
+    gallery_df = gallery_df.copy()
+    if "image_path" in gallery_df.columns and "original_file_name" not in gallery_df.columns:
+        gallery_df["original_file_name"] = gallery_df["image_path"].map(
+            lambda value: os.path.basename(str(value))
+        )
+    return gallery_df
 
 
 def build_hnsw(fused: np.ndarray, out_path: str, m: int, ef_construction: int, ef_search: int):
@@ -63,10 +73,24 @@ def main(args):
     hnsw_path = os.path.join(args.index_dir, "gallery_fused_hnsw.bin")
     build_hnsw(fused, hnsw_path, args.m, args.ef_construction, args.ef_search)
 
-    gallery_df = load_gallery_metadata(args.index_dir)
+    gallery_df = add_derived_metadata(load_gallery_metadata(args.index_dir))
     if len(gallery_df) != fused.shape[0]:
         raise ValueError(
             f"Row mismatch: gallery csv rows={len(gallery_df)}, fused embeddings={fused.shape[0]}"
+        )
+
+    metadata_pickle_path = os.path.join(args.index_dir, "gallery_metadata.pkl")
+    with open(metadata_pickle_path, "wb") as f:
+        pickle.dump(
+            {
+                "metadata": gallery_df.to_dict(orient="records"),
+                "columns": gallery_df.columns.tolist(),
+                "num_indexed": int(fused.shape[0]),
+                "embedding_dim": int(fused.shape[1]),
+                "row_alignment": "metadata row i matches embedding/index label i",
+            },
+            f,
+            protocol=pickle.HIGHEST_PROTOCOL,
         )
 
     config_path = os.path.join(args.index_dir, "config.json")
@@ -85,6 +109,7 @@ def main(args):
             "index_type": "hnswlib_cosine",
             "hnsw_index_file": "gallery_fused_hnsw.bin",
             "fused_embeddings_file": "gallery_fused_embs.npy",
+            "metadata_file": "gallery_metadata.pkl",
             "hnsw_m": args.m,
             "hnsw_ef_construction": args.ef_construction,
             "hnsw_ef_search": args.ef_search,
@@ -97,6 +122,7 @@ def main(args):
     print("Done.")
     print(f"Saved fused embeddings: {fused_path}")
     print(f"Saved HNSW index:      {hnsw_path}")
+    print(f"Saved metadata pickle: {metadata_pickle_path}")
     print(f"Indexed items:         {fused.shape[0]}")
     print(f"Embedding dimension:   {fused.shape[1]}")
 

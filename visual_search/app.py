@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from typing import List, Tuple
 
 import hnswlib
@@ -21,7 +22,7 @@ from transformers import (
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 YOLOS_MODEL_ID = "valentinafevu/yolos-fashionpedia"
 BLIP2_ITM_MODEL_ID = "Salesforce/blip2-itm-vit-g"
-CLIP_MODEL_NAME = "ViT-L-14"
+CLIP_MODEL_NAME = "ViT-B-32"
 CLIP_PRETRAINED = "openai"
 TOP_K_VALUES = (5, 10, 15)
 MAX_CANDIDATES = max(TOP_K_VALUES)
@@ -92,12 +93,30 @@ def load_config(index_dir: str):
 
 @st.cache_data
 def load_gallery_df(index_dir: str):
+    config = load_config(index_dir)
+    metadata_file = config.get("metadata_file", "gallery_metadata.pkl")
+    pickle_path = os.path.join(index_dir, metadata_file)
+    if os.path.exists(pickle_path):
+        with open(pickle_path, "rb") as f:
+            payload = pickle.load(f)
+        if isinstance(payload, dict) and "metadata" in payload:
+            return add_derived_metadata(pd.DataFrame(payload["metadata"]))
+        if isinstance(payload, pd.DataFrame):
+            return add_derived_metadata(payload)
+
     csv_path = os.path.join(index_dir, "gallery_index_blip.csv")
     if not os.path.exists(csv_path):
         csv_path = os.path.join(index_dir, "gallery_index.csv")
     if not os.path.exists(csv_path):
         raise FileNotFoundError("Missing gallery_index_blip.csv / gallery_index.csv")
-    return pd.read_csv(csv_path)
+    return add_derived_metadata(pd.read_csv(csv_path))
+
+
+def add_derived_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "image_path" in df.columns and "original_file_name" not in df.columns:
+        df["original_file_name"] = df["image_path"].map(lambda value: os.path.basename(str(value)))
+    return df
 
 
 @st.cache_resource
@@ -219,6 +238,16 @@ def resolve_gallery_image_path(value: str, img_dir: str):
     return os.path.join(img_dir, os.path.basename(value))
 
 
+def resolve_display_image_path(row, img_col: str, gallery_dir: str, original_dir: str):
+    source_value = str(row[img_col])
+    filename = str(row.get("original_file_name", os.path.basename(source_value)))
+    if original_dir.strip():
+        candidate = os.path.join(original_dir.strip(), filename)
+        if os.path.exists(candidate):
+            return candidate, "original"
+    return resolve_gallery_image_path(source_value, gallery_dir), "gallery"
+
+
 def hnsw_retrieve(index, query_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     labels, distances = index.knn_query(query_emb, k=k)
     # cosine distance -> similarity
@@ -229,8 +258,10 @@ def hnsw_retrieve(index, query_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.
 st.sidebar.title("Settings")
 index_dir = st.sidebar.text_input("Index Directory", "./index")
 gallery_dir = st.sidebar.text_input("Gallery Images Directory", "./data/split_images/gallery")
+original_dir = st.sidebar.text_input("Original Images Directory (optional)", "")
 checkpoint_path = st.sidebar.text_input("Finetuned CLIP checkpoint", "./clip_finetuned.pt")
 det_threshold = st.sidebar.number_input("YOLOS confidence", 0.01, 0.99, 0.30, step=0.05)
+st.sidebar.caption("Leave Original Images Directory blank for now; when you share the folder, matching filenames will be loaded from there.")
 
 if not os.path.exists(checkpoint_path):
     st.error(f"Missing finetuned checkpoint: {checkpoint_path}")
@@ -355,16 +386,21 @@ if st.session_state.results:
     for tab, k in zip(tabs, TOP_K_VALUES):
         with tab:
             subset = sorted(st.session_state.results[:k], key=lambda r: r["itm_score"], reverse=True)
-            cols = st.columns(5)
             for rank, item in enumerate(subset, 1):
                 row = gallery_df.iloc[item["index"]]
-                fpath = resolve_gallery_image_path(row[img_col], gallery_dir)
-                with cols[(rank - 1) % 5]:
+                fpath, image_source = resolve_display_image_path(row, img_col, gallery_dir, original_dir)
+                caption = row_caption(row)
+                original_name = row.get("original_file_name", os.path.basename(str(row[img_col])))
+                image_col, detail_col = st.columns([0.25, 0.75])
+                with image_col:
                     if os.path.exists(fpath):
                         st.image(fpath, use_container_width=True)
                     else:
                         st.warning("image not found")
+                with detail_col:
                     st.write(f"**Final rank #{rank}**")
+                    st.write(caption)
+                    st.caption(f"File: {original_name}")
+                    st.caption(f"Image source: {image_source}")
                     st.caption(f"ITM: {item['itm_score']:.4f}")
                     st.caption(f"HNSW cosine: {item['clip_score']:.4f} | initial #{item['initial_rank']}")
-                    st.caption(row_caption(row))

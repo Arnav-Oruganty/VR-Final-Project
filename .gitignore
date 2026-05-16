@@ -12,10 +12,9 @@ venv/
 visual_search/data/
 visual_search/index/*.npy
 visual_search/index/*.zip
-visual_search/index/*.csv
 visual_search/index/blip_index/
 visual_search/captions*.csv
-BLIP_captions.csv
+visual_search/*.pt
 
 # Model weights and checkpoints
 

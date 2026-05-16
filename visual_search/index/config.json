@@ -14,5 +14,6 @@
   "fused_embeddings_file": "gallery_fused_embs.npy",
   "hnsw_m": 32,
   "hnsw_ef_construction": 200,
-  "hnsw_ef_search": 128
+  "hnsw_ef_search": 128,
+  "metadata_file": "gallery_metadata.pkl"
 }

@@ -14,7 +14,10 @@ visual_search/index/*.npy
 visual_search/index/*.zip
 visual_search/index/blip_index/
 visual_search/captions*.csv
-visual_search/*.pt
+
+visual_search/clip-model/clip_finetuned.pt
+
+yolo-models
 
 # Model weights and checkpoints
 
@@ -23,10 +26,6 @@ visual_search/*.pt
 *.onnx
 *.bin
 *.safetensors
-
-# Keep lightweight placeholders/configs trackable
-!visual_search/checkpoints/.gitkeep
-!visual_search/index/config.json
 
 # Local planning notes
 plan.md
